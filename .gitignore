@@ -1,0 +1,7 @@
+node_modules/
+gsd-backend/data/*.sqlite
+gsd-backend/data/*.sqlite-shm
+gsd-backend/data/*.sqlite-wal
+.env
+.claude
+DEPLOY.md

@@ -1,0 +1,793 @@
+const GSD_API = '/api';
+const GSD_PAGE_SIZE = 10;
+
+async function gsdRequest(path, options = {}) {
+  const response = await fetch(`${GSD_API}${path}`, {
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options
+  });
+  const type = response.headers.get('content-type') || '';
+  const payload = type.includes('application/json') ? await response.json() : null;
+  if (!response.ok) throw new Error(payload?.error || 'The request could not be completed.');
+  return payload;
+}
+
+function gsdEscape(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[character]);
+}
+
+function gsdToast(message, isError = false) {
+  const toast = document.getElementById('toast') || document.getElementById('toastBanner');
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.toggle('error', isError);
+  toast.classList.add('show');
+  clearTimeout(gsdToast.timer);
+  gsdToast.timer = setTimeout(() => toast.classList.remove('show'), 3200);
+}
+
+// Asks the admin for a new password in a modal (masked input, min length, confirmation field).
+// Resolves to the password, or null when cancelled.
+function gsdPromptPassword(title, message) {
+  const dialog = document.createElement('dialog');
+  dialog.className = 'gsd-dialog';
+  dialog.innerHTML = `
+    <div class="gsd-dialog-mark" aria-hidden="true">GSD</div>
+    <h2 class="gsd-dialog-title"></h2>
+    <p class="gsd-dialog-message"></p>
+    <form method="dialog" class="gsd-dialog-form">
+      <label>New password<input type="password" name="password" minlength="10" required autocomplete="new-password"></label>
+      <label>Confirm password<input type="password" name="confirm" minlength="10" required autocomplete="new-password"></label>
+      <p class="gsd-dialog-error" role="alert"></p>
+      <div class="gsd-dialog-actions">
+        <button type="button" class="gsd-dialog-button secondary" value="cancel">Cancel</button>
+        <button type="submit" class="gsd-dialog-button primary">Set password</button>
+      </div>
+    </form>`;
+  dialog.querySelector('.gsd-dialog-title').textContent = title;
+  dialog.querySelector('.gsd-dialog-message').textContent = message;
+  document.body.appendChild(dialog);
+  const form = dialog.querySelector('form');
+  const error = dialog.querySelector('.gsd-dialog-error');
+  return new Promise(resolve => {
+    let result = null;
+    dialog.querySelector('button[value="cancel"]').addEventListener('click', () => dialog.close());
+    form.addEventListener('submit', event => {
+      if (form.password.value !== form.confirm.value) {
+        event.preventDefault();
+        error.textContent = 'The passwords do not match.';
+        return;
+      }
+      result = form.password.value;
+    });
+    dialog.addEventListener('close', () => { dialog.remove(); resolve(result); }, { once: true });
+    dialog.showModal();
+    form.password.focus();
+  });
+}
+
+function gsdShowDialog({ title, message, confirmLabel = 'OK', cancelLabel = null, danger = false }) {
+  let dialog = document.getElementById('gsdMessageDialog');
+  if (!dialog) {
+    dialog = document.createElement('dialog');
+    dialog.id = 'gsdMessageDialog';
+    dialog.className = 'gsd-dialog';
+    dialog.innerHTML = `
+      <div class="gsd-dialog-mark" aria-hidden="true">GSD</div>
+      <h2 class="gsd-dialog-title"></h2>
+      <p class="gsd-dialog-message"></p>
+      <div class="gsd-dialog-actions"></div>`;
+    document.body.appendChild(dialog);
+    dialog.addEventListener('click', event => {
+      if (event.target === dialog) dialog.close('cancel');
+    });
+  }
+
+  dialog.querySelector('.gsd-dialog-title').textContent = title;
+  dialog.querySelector('.gsd-dialog-message').textContent = message;
+  const actions = dialog.querySelector('.gsd-dialog-actions');
+  actions.replaceChildren();
+
+  if (cancelLabel) {
+    const cancelButton = document.createElement('button');
+    cancelButton.type = 'button';
+    cancelButton.className = 'gsd-dialog-button secondary';
+    cancelButton.textContent = cancelLabel;
+    cancelButton.addEventListener('click', () => dialog.close('cancel'));
+    actions.appendChild(cancelButton);
+  }
+
+  const confirmButton = document.createElement('button');
+  confirmButton.type = 'button';
+  confirmButton.className = `gsd-dialog-button${danger ? ' danger' : ' primary'}`;
+  confirmButton.textContent = confirmLabel;
+  confirmButton.addEventListener('click', () => dialog.close('confirm'));
+  actions.appendChild(confirmButton);
+
+  return new Promise(resolve => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), { once: true });
+    dialog.showModal();
+    confirmButton.focus();
+  });
+}
+
+function gsdToday() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+function gsdDisplayDate(value) {
+  if (!value) return '';
+  const date = new Date(`${String(value).slice(0, 10)}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('en-GB');
+}
+
+function gsdFormatNumber(value) {
+  return Number(value || 0).toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
+
+function gsdEnsurePagination(id, afterElement) {
+  let pagination = document.getElementById(id);
+  if (!pagination) {
+    pagination = document.createElement('nav');
+    pagination.id = id;
+    pagination.className = 'gsd-pagination';
+    pagination.setAttribute('aria-label', 'Table pagination');
+    afterElement.insertAdjacentElement('afterend', pagination);
+  }
+  return pagination;
+}
+
+function gsdRenderPagination(container, totalRows, currentPage, onPageChange) {
+  const pageCount = Math.max(1, Math.ceil(totalRows / GSD_PAGE_SIZE));
+  const page = Math.min(Math.max(currentPage, 1), pageCount);
+  const firstRow = totalRows ? (page - 1) * GSD_PAGE_SIZE + 1 : 0;
+  const lastRow = Math.min(page * GSD_PAGE_SIZE, totalRows);
+  const summary = document.createElement('span');
+  summary.className = 'gsd-pagination-summary';
+  summary.setAttribute('aria-live', 'polite');
+  summary.textContent = totalRows ? `Showing ${firstRow}-${lastRow} of ${totalRows}` : 'No rows to display';
+
+  const controls = document.createElement('div');
+  controls.className = 'gsd-pagination-controls';
+  const previous = document.createElement('button');
+  previous.type = 'button';
+  previous.className = 'gsd-page-button';
+  previous.textContent = 'Previous';
+  previous.disabled = page <= 1;
+  previous.addEventListener('click', () => onPageChange(page - 1));
+
+  const pageLabel = document.createElement('span');
+  pageLabel.className = 'gsd-page-label';
+  pageLabel.textContent = `Page ${page} of ${pageCount}`;
+
+  const next = document.createElement('button');
+  next.type = 'button';
+  next.className = 'gsd-page-button';
+  next.textContent = 'Next';
+  next.disabled = page >= pageCount;
+  next.addEventListener('click', () => onPageChange(page + 1));
+
+  controls.append(previous, pageLabel, next);
+  container.replaceChildren(summary, controls);
+  container.hidden = false;
+  return page;
+}
+
+function gsdDownloadCsv(filename, rows) {
+  const csv = rows.map(row => row.map(value => `"${String(value ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function gsdSetUser(user) {
+  document.querySelectorAll('#headerUserName, .user-name').forEach(element => {
+    element.textContent = user.name.toUpperCase();
+  });
+  document.querySelectorAll('#headerUserRole, .user-role').forEach(element => {
+    element.textContent = user.role.toUpperCase();
+  });
+  if (user.role !== 'Admin') {
+    document.querySelectorAll('a[href="settings.html"], a[href="usermanagement.html"]').forEach(link => {
+      link.closest('.nav-item')?.remove();
+    });
+  }
+}
+
+function gsdBindLogout() {
+  document.getElementById('logoutBtn')?.addEventListener('click', async () => {
+    const confirmed = await gsdShowDialog({
+      title: 'Confirm log out?',
+      message: 'You will be signed out of the GSD Inventory Management System.',
+      confirmLabel: 'Yes, log out',
+      cancelLabel: 'No, stay',
+      danger: true
+    });
+    if (!confirmed) return;
+    try { await gsdRequest('/auth/logout', { method: 'POST', body: '{}' }); } catch {}
+    window.location.replace('index.html');
+  });
+}
+
+async function gsdInitialize() {
+  if (location.protocol === 'file:') {
+    const style = document.createElement('style');
+    style.textContent = `
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; box-sizing: border-box; background: #f4f7f5; color: #1e293b; font: 16px/1.5 'Segoe UI', sans-serif; }
+      .server-required { width: min(100%, 560px); padding: 32px; border-left: 5px solid #266b47; background: #fff; box-shadow: 0 12px 32px rgba(0,0,0,.08); }
+      .server-required h1 { margin: 0 0 12px; font-size: 24px; }
+      .server-required p { margin: 0 0 16px; }
+      .server-required code { display: block; margin: 12px 0; padding: 12px; overflow-wrap: anywhere; background: #f3f4f6; }
+      .server-required a { color: #1f583a; font-weight: 700; }
+    `;
+    const panel = document.createElement('main');
+    panel.className = 'server-required';
+    panel.innerHTML = '<h1>Start the GSD server to sign in</h1><p>This page was opened directly from a file. Login and inventory data require the application server, so the browser cannot reach the API from this address.</p><p>From the workspace folder, run:</p><code>cd gsd-backend<br>npm.cmd start</code><p>Then open <a href="http://localhost:3000">http://localhost:3000</a>.</p>';
+    document.head.replaceChildren(style);
+    document.body.replaceChildren(panel);
+    return;
+  }
+  const page = location.pathname.split('/').pop() || 'index.html';
+  const protectedPage = page !== 'index.html';
+  let user = null;
+  try {
+    const result = await gsdRequest('/auth/me');
+    user = result.user;
+  } catch {
+    if (protectedPage) {
+      window.location.replace('index.html');
+      return;
+    }
+  }
+
+  if (protectedPage && !user) {
+    window.location.replace('index.html');
+    return;
+  }
+  if (protectedPage && user.role !== 'Admin' && ['settings.html', 'usermanagement.html'].includes(page)) {
+    window.location.replace('inventory.html');
+    return;
+  }
+  if (page === 'index.html' && user) {
+    window.location.replace(user.role === 'Admin' ? 'inventory.html' : 'inventory.html');
+    return;
+  }
+  if (user) {
+    gsdSetUser(user);
+    gsdBindLogout();
+  }
+
+  if (page === 'index.html') gsdLoginPage();
+  if (page === 'inventory.html') await gsdInventoryPage();
+  if (page === 'purchaseorder.html') await gsdPurchaseOrderPage();
+  if (page === 'stockout.html') await gsdStockOutPage();
+  if (page === 'returnslip.html') await gsdReturnPage();
+  if (page === 'stockcard.html') await gsdStockCardPage();
+  if (page === 'settings.html') gsdSettingsPage();
+  if (page === 'usermanagement.html') gsdUserManagementPage(user);
+}
+
+function gsdLoginPage() {
+  const form = document.getElementById('loginForm');
+  const resetForm = document.getElementById('resetRequestForm');
+  const loginPanel = document.getElementById('loginPanel');
+  const resetLink = document.getElementById('forgotPasswordLink');
+  form?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const button = form.querySelector('[type="submit"]');
+    button.disabled = true;
+    try {
+      const { user } = await gsdRequest('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ username: form.username.value, password: form.password.value })
+      });
+      await gsdShowDialog({
+        title: 'Welcome',
+        message: `Welcome ${user.username}`,
+        confirmLabel: 'Continue'
+      });
+      window.location.assign(user.role === 'Admin' ? 'inventory.html' : 'inventory.html');
+    } catch (error) {
+      gsdToast(error.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  resetLink?.addEventListener('click', event => {
+    event.preventDefault();
+    loginPanel.hidden = !loginPanel.hidden;
+    resetForm.hidden = !loginPanel.hidden;
+    resetLink.textContent = loginPanel.hidden ? 'Back to sign in' : 'Forgot Password?';
+  });
+  resetForm?.addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      const body = Object.fromEntries(new FormData(resetForm));
+      const result = await gsdRequest('/auth/reset-requests', { method: 'POST', body: JSON.stringify(body) });
+      gsdToast(result.message);
+      resetForm.reset();
+      loginPanel.hidden = false;
+      resetForm.hidden = true;
+      resetLink.textContent = 'Forgot Password?';
+    } catch (error) {
+      gsdToast(error.message, true);
+    }
+  });
+  document.getElementById('togglePassword')?.addEventListener('click', () => {
+    const input = document.getElementById('password');
+    input.type = input.type === 'password' ? 'text' : 'password';
+  });
+}
+
+async function gsdGetInventory() {
+  return (await gsdRequest('/inventory')).items;
+}
+
+function gsdProductOptions(items) {
+  return items.map(item => `<option value="${gsdEscape(item.name)}"></option>`).join('');
+}
+
+async function gsdInventoryPage() {
+  const items = await gsdGetInventory();
+  const tbody = document.getElementById('inventoryTableBody');
+  const actions = document.getElementById('actionsColumnBody');
+  const queryInput = document.getElementById('searchInput');
+  const categorySelect = document.getElementById('categoryFilter');
+  const lowStock = items.filter(item => Number(item.quantity) <= Number(item.reorder_point)).length;
+  const totalCount = document.getElementById('totalProductsKpi');
+  if (totalCount) totalCount.textContent = items.length;
+  const lowCount = document.getElementById('lowStockKpi');
+  if (lowCount) lowCount.textContent = lowStock;
+  const categories = [...new Set(items.map(item => item.category))].sort();
+  if (categorySelect) {
+    categorySelect.innerHTML = '<option value="All Categories">All Categories</option>' + categories.map(value => `<option>${gsdEscape(value)}</option>`).join('');
+  }
+  const monthSelect = document.getElementById('monthFilter');
+  const monthKey = item => String(item.created_at || '').slice(0, 7);
+  if (monthSelect) {
+    const months = [...new Set(items.map(monthKey).filter(Boolean))].sort().reverse();
+    monthSelect.innerHTML = '<option value="All Months">All Months</option>' + months.map(value => {
+      const label = new Date(`${value}-01T00:00:00`).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+      return `<option value="${value}">${label}</option>`;
+    }).join('');
+  }
+  let currentPage = 1;
+  const pagination = gsdEnsurePagination('inventoryPagination', document.querySelector('.table-layout'));
+  const render = () => {
+    const query = queryInput?.value.trim().toLowerCase() || '';
+    const category = categorySelect?.value || 'All Categories';
+    const month = monthSelect?.value || 'All Months';
+    const visible = items.filter(item => (!query || `${item.name} PROD${String(item.id).padStart(4, '0')}`.toLowerCase().includes(query))
+      && (category === 'All Categories' || item.category === category)
+      && (month === 'All Months' || monthKey(item) === month));
+    const pageCount = Math.max(1, Math.ceil(visible.length / GSD_PAGE_SIZE));
+    currentPage = Math.min(currentPage, pageCount);
+    const pageItems = visible.slice((currentPage - 1) * GSD_PAGE_SIZE, currentPage * GSD_PAGE_SIZE);
+    tbody.innerHTML = pageItems.map(item => `
+      <tr>
+        <td>PROD${String(item.id).padStart(4, '0')}</td>
+        <td>${gsdEscape(item.created_by)}</td>
+        <td>${gsdEscape(item.name)}</td>
+        <td>${gsdEscape(item.category)}</td>
+        <td>${gsdFormatNumber(item.quantity)}</td>
+        <td>${gsdEscape(item.unit)}</td>
+        <td><span class="badge ${Number(item.quantity) <= Number(item.reorder_point) ? 'badge-lowstock' : 'badge-instock'}">${Number(item.quantity) <= Number(item.reorder_point) ? 'Low Stock' : 'In Stock'}</span></td>
+        <td>${gsdDisplayDate(item.created_at)}</td>
+      </tr>`).join('');
+    currentPage = gsdRenderPagination(pagination, visible.length, currentPage, page => {
+      currentPage = page;
+      render();
+    });
+    if (actions) actions.innerHTML = '<p>Stock adjustments are recorded through PO, SRF, and return transactions.</p>';
+  };
+  queryInput?.addEventListener('input', () => { currentPage = 1; render(); });
+  categorySelect?.addEventListener('change', () => { currentPage = 1; render(); });
+  monthSelect?.addEventListener('change', () => { currentPage = 1; render(); });
+  document.getElementById('printBtn')?.addEventListener('click', () => window.print());
+  document.getElementById('exportCsvBtn')?.addEventListener('click', () => gsdDownloadCsv('gsd-inventory.csv', [
+    ['Item ID', 'Item', 'Category', 'Quantity', 'Unit', 'Reorder Point'],
+    ...items.map(item => [item.id, item.name, item.category, item.quantity, item.unit, item.reorder_point])
+  ]));
+  render();
+}
+
+function gsdWireClear(form, button) {
+  button?.addEventListener('click', () => form?.reset());
+}
+
+// Transaction date field: defaults to today (also after form.reset()) and cannot be in the future.
+function gsdDateField() {
+  const input = document.getElementById('txnDateInput');
+  if (input) {
+    input.max = gsdToday();
+    input.defaultValue = gsdToday();
+    input.value = gsdToday();
+  }
+  return () => input?.value || gsdToday();
+}
+
+async function gsdPurchaseOrderPage() {
+  const form = document.getElementById('purchaseOrderForm');
+  const txnDate = gsdDateField();
+  const inventory = await gsdGetInventory();
+  const input = document.getElementById('productNameInput');
+  const list = document.getElementById('productSuggestions');
+  list.innerHTML = gsdProductOptions(inventory);
+  input.addEventListener('change', () => {
+    const item = inventory.find(row => row.name.toLowerCase() === input.value.trim().toLowerCase());
+    if (item) {
+      document.getElementById('categoryInput').value = item.category;
+      document.getElementById('unitInput').value = item.unit;
+    }
+  });
+  const updateTotal = () => {
+    const quantity = Number(document.getElementById('quantityInput').value);
+    const cost = Number(document.getElementById('unitCostInput').value);
+    document.getElementById('totalCostInput').value = quantity > 0 && cost >= 0 ? (quantity * cost).toFixed(2) : '';
+  };
+  document.getElementById('quantityInput').addEventListener('input', updateTotal);
+  document.getElementById('unitCostInput').addEventListener('input', updateTotal);
+  gsdWireClear(form, document.getElementById('clearFormBtn'));
+  document.getElementById('clearRecentBtn')?.addEventListener('click', () => {
+    document.getElementById('recentPoContainer').innerHTML = '<p>Recent transactions remain in the audit history.</p>';
+  });
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const body = {
+      type: 'PO', reference: document.getElementById('referenceInput').value,
+      itemName: input.value, category: document.getElementById('categoryInput').value,
+      unit: document.getElementById('unitInput').value, quantity: document.getElementById('quantityInput').value,
+      unitCost: document.getElementById('unitCostInput').value, date: txnDate()
+    };
+    try {
+      await gsdRequest('/transactions', { method: 'POST', body: JSON.stringify(body) });
+      gsdToast('Purchase order recorded and stock updated.');
+      form.reset();
+      await gsdRenderRecent('PO', 'recentPoContainer');
+      list.innerHTML = gsdProductOptions(await gsdGetInventory());
+    } catch (error) { gsdToast(error.message, true); }
+  });
+  await gsdRenderRecent('PO', 'recentPoContainer');
+}
+
+async function gsdStockOutPage() {
+  const form = document.getElementById('stockOutForm');
+  const txnDate = gsdDateField();
+  let inventory = await gsdGetInventory();
+  document.getElementById('inventoryProductList').innerHTML = gsdProductOptions(inventory);
+  const product = document.getElementById('productDeductInput');
+  const quantity = document.getElementById('quantityDeductInput');
+  const cost = document.getElementById('unitCostInput');
+  const update = () => {
+    const item = inventory.find(row => row.name.toLowerCase() === product.value.trim().toLowerCase());
+    document.getElementById('availableStockHint').textContent = item ? `Available: ${gsdFormatNumber(item.quantity)} ${item.unit}` : '';
+    document.getElementById('unitInput').value = item?.unit || '';
+    const amount = Number(quantity.value) * Number(cost.value);
+    document.getElementById('totalBalanceValueInput').value = amount > 0 ? amount.toFixed(2) : '';
+  };
+  [product, quantity, cost].forEach(input => input.addEventListener('input', update));
+  gsdWireClear(form, document.getElementById('clearFormBtn'));
+  document.getElementById('clearRecentBtn')?.addEventListener('click', () => {
+    document.getElementById('recentStockOutContainer').innerHTML = '<p>Recent transactions remain in the audit history.</p>';
+  });
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      await gsdRequest('/transactions', { method: 'POST', body: JSON.stringify({
+        type: 'SRF', reference: document.getElementById('srfReferenceInput').value,
+        itemName: product.value, quantity: quantity.value, unit: document.getElementById('unitInput').value,
+        unitCost: cost.value, office: document.getElementById('officeInput').value, date: txnDate()
+      }) });
+      gsdToast('SRF recorded and stock deducted.');
+      form.reset();
+      inventory = await gsdGetInventory();
+      update();
+      await gsdRenderRecent('SRF', 'recentStockOutContainer');
+    } catch (error) { gsdToast(error.message, true); }
+  });
+  await gsdRenderRecent('SRF', 'recentStockOutContainer');
+}
+
+async function gsdReturnPage() {
+  const form = document.getElementById('returnSlipForm');
+  const txnDate = gsdDateField();
+  const inventory = await gsdGetInventory();
+  document.getElementById('returnProductList').innerHTML = gsdProductOptions(inventory);
+  const product = document.getElementById('productNameInput');
+  product.addEventListener('change', () => {
+    const item = inventory.find(row => row.name.toLowerCase() === product.value.trim().toLowerCase());
+    if (item) document.getElementById('unitInput').value = item.unit;
+  });
+  document.getElementById('srfReferenceList').innerHTML = (await gsdRequest('/transactions?type=SRF&limit=500')).transactions
+    .map(row => `<option value="${gsdEscape(row.reference)}"></option>`).join('');
+  gsdWireClear(form, document.getElementById('clearFormBtn'));
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const reference = `RS-${gsdToday().replace(/-/g, '')}-${String(Date.now()).slice(-5)}`;
+    const details = {
+      originalSrf: document.getElementById('originalSrfInput').value,
+      returningOffice: document.getElementById('returningOfficeInput').value,
+      department: document.getElementById('departmentInput').value,
+      resender: document.getElementById('resenderInput').value,
+      receiver: document.getElementById('receiverInput').value,
+      reason: document.getElementById('reasonInput').value
+    };
+    const date = txnDate();
+    try {
+      await gsdRequest('/transactions', { method: 'POST', body: JSON.stringify({
+        type: 'RETURN', reference, itemName: product.value, quantity: document.getElementById('quantityReturnInput').value,
+        unit: document.getElementById('unitInput').value, office: details.returningOffice, notes: details.reason, details, date
+      }) });
+      gsdUpdatePrintSlip({ ...details, reference, itemName: product.value, quantity: document.getElementById('quantityReturnInput').value, unit: document.getElementById('unitInput').value, date });
+      gsdToast('Return slip recorded and stock restored.');
+      form.reset();
+      await gsdRenderRecent('RETURN', 'recentSlipContainer');
+    } catch (error) { gsdToast(error.message, true); }
+  });
+  document.getElementById('printSlipBtn')?.addEventListener('click', () => window.print());
+  await gsdRenderRecent('RETURN', 'recentSlipContainer');
+  const latestReturn = (await gsdRequest('/transactions?type=RETURN&limit=1')).transactions[0];
+  if (latestReturn) {
+    let details = {};
+    if (latestReturn.metadata && typeof latestReturn.metadata === 'object') details = latestReturn.metadata;
+    else try { details = JSON.parse(latestReturn.metadata || '{}'); } catch { details = {}; }
+    gsdUpdatePrintSlip({
+      ...details, reference: latestReturn.reference, itemName: latestReturn.item_name,
+      quantity: latestReturn.quantity, unit: latestReturn.unit, date: latestReturn.occurred_on
+    });
+  }
+}
+
+function gsdUpdatePrintSlip(data) {
+  const slip = {
+    originalSrf: '-', returningOffice: '-', department: '-', resender: '-', receiver: '-', reason: '-',
+    ...data
+  };
+  const values = {
+    psSlipNo: slip.reference, psRefNo: `${slip.originalSrf} (${slip.returningOffice})`, psDate: gsdDisplayDate(slip.date),
+    psResender: slip.resender, psDepartment: slip.department, psReceiver: slip.receiver,
+    psItemDesc: slip.itemName, psQty: slip.quantity, psUnit: slip.unit, psRemarks: slip.reason,
+    psTotalItems: 'TOTAL ITEMS: 1', psTotalQty: `TOTAL QUANTITY RETURNED: ${slip.quantity} ${slip.unit}`,
+    psReasonBody: slip.reason, psSignResender: slip.resender.toUpperCase(), psSignReceiver: slip.receiver.toUpperCase()
+  };
+  Object.entries(values).forEach(([id, value]) => {
+    const element = document.getElementById(id);
+    if (element) element.textContent = value;
+  });
+}
+
+async function gsdRenderRecent(type, targetId) {
+  const target = document.getElementById(targetId);
+  if (!target) return;
+  const { transactions: rows } = await gsdRequest(`/transactions?type=${type}&limit=8`);
+  if (!rows.length) {
+    target.innerHTML = '<p>No transactions recorded yet.</p>';
+    return;
+  }
+  target.innerHTML = rows.map(row => `
+    <article class="recent-po-entry">
+      <strong>${gsdEscape(row.reference)}</strong>
+      <div>${gsdEscape(row.item_name)}</div>
+      <div>${gsdFormatNumber(row.quantity)} ${gsdEscape(row.unit)} · ${gsdDisplayDate(row.occurred_on)}</div>
+      ${row.office ? `<div>${gsdEscape(row.office)}</div>` : ''}
+      <small>${gsdEscape(row.actor_name || 'System')}</small>
+    </article>`).join('');
+}
+
+async function gsdStockCardPage() {
+  const search = document.getElementById('stockCardSearch');
+  const datalist = document.getElementById('stockCardItemList');
+  let current = null;
+  const render = async (query = search.value.trim()) => {
+    const result = await gsdRequest(`/stock-card?item=${encodeURIComponent(query)}`);
+    current = result;
+    datalist.innerHTML = (result.matches || []).map(item => `<option value="${gsdEscape(item.name)}"></option>`).join('');
+    const { item, transactions } = result;
+    const body = document.getElementById('stockCardBody');
+    const printBody = document.getElementById('pscLedgerBody');
+    const pagination = gsdEnsurePagination('stockCardPagination', body.closest('.table-wrapper'));
+    if (!item) {
+      body.innerHTML = '<tr><td colspan="7">No matching inventory item.</td></tr>';
+      printBody.innerHTML = body.innerHTML;
+      gsdRenderPagination(pagination, 0, 1, () => {});
+      return;
+    }
+    const received = transactions.filter(row => row.type !== 'SRF').reduce((sum, row) => sum + Number(row.quantity), 0);
+    const issued = transactions.filter(row => row.type === 'SRF').reduce((sum, row) => sum + Number(row.quantity), 0);
+    const rowHtml = transactions.map(row => {
+      const metadata = row.metadata || {};
+      const receipt = row.type === 'SRF' ? '-' : gsdFormatNumber(row.quantity);
+      const issue = row.type === 'SRF' ? gsdFormatNumber(row.quantity) : '-';
+      const label = row.type === 'PO' ? 'PO' : row.type === 'SRF' ? 'SRF' : row.type === 'RETURN' ? 'Return' : 'Opening';
+      return `<tr><td>${gsdDisplayDate(row.occurred_on)}</td><td>${gsdEscape(row.reference)} <small>${label}</small></td><td>${receipt}</td><td>${issue}</td><td>${gsdEscape(row.office || '-')}</td><td><strong>${gsdFormatNumber(row.balance)}</strong></td><td>-</td></tr>`;
+    }).join('');
+    const pageCount = Math.max(1, Math.ceil(transactions.length / GSD_PAGE_SIZE));
+    ledgerPage = Math.min(ledgerPage, pageCount);
+    const visibleRows = transactions.length
+      ? rowHtml.split('</tr>').filter(Boolean).slice((ledgerPage - 1) * GSD_PAGE_SIZE, ledgerPage * GSD_PAGE_SIZE).map(row => `${row}</tr>`).join('')
+      : '<tr><td colspan="7">No movements recorded.</td></tr>';
+    body.innerHTML = visibleRows;
+    printBody.innerHTML = rowHtml || '<tr><td colspan="7">No movements recorded.</td></tr>';
+    ledgerPage = gsdRenderPagination(pagination, transactions.length, ledgerPage, page => {
+      ledgerPage = page;
+      render(query);
+    });
+    const unitLabel = item.unit;
+    const set = (id, value) => { const element = document.getElementById(id); if (element) element.textContent = value; };
+    set('metaItemName', item.name); set('metaUnit', unitLabel); set('metaCurrentBalance', `${gsdFormatNumber(item.quantity)} ${unitLabel}`);
+    set('metaDescription', item.category); set('metaStockNo', `PROD${String(item.id).padStart(4, '0')}`); set('metaReorderPoint', gsdFormatNumber(item.reorder_point));
+    set('pscItemName', item.name); set('pscUnit', unitLabel); set('pscCurrentBalance', `${gsdFormatNumber(item.quantity)} ${unitLabel}`);
+    set('pscDescription', item.category); set('pscStockNo', `PROD${String(item.id).padStart(4, '0')}`); set('pscReorderPoint', gsdFormatNumber(item.reorder_point));
+    set('poCount', transactions.filter(row => row.type === 'PO').length);
+    set('srfCount', transactions.filter(row => row.type === 'SRF').length);
+    set('totalReceived', gsdFormatNumber(received)); set('totalIssued', gsdFormatNumber(issued));
+  };
+  let ledgerPage = 1;
+  let searchTimer;
+  search.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    ledgerPage = 1;
+    searchTimer = setTimeout(() => render().catch(error => gsdToast(error.message, true)), 180);
+  });
+  search.addEventListener('change', () => { ledgerPage = 1; render().catch(error => gsdToast(error.message, true)); });
+  search.addEventListener('keydown', event => {
+    if (event.key === 'Enter') { event.preventDefault(); ledgerPage = 1; render().catch(error => gsdToast(error.message, true)); }
+  });
+  document.getElementById('printBtn')?.addEventListener('click', () => window.print());
+  document.getElementById('exportCsvBtn')?.addEventListener('click', () => {
+    if (!current?.item) return;
+    gsdDownloadCsv('gsd-stock-card.csv', [
+      ['Date', 'Reference', 'Type', 'Receipt', 'Issue', 'Office', 'Balance'],
+      ...current.transactions.map(row => [row.occurred_on, row.reference, row.type, row.type === 'SRF' ? '' : row.quantity, row.type === 'SRF' ? row.quantity : '', row.office, row.balance])
+    ]);
+  });
+  search.value = search.value || 'VINYL';
+  await render(search.value);
+}
+
+function gsdSettingsPage() {
+  const modal = document.getElementById('wipeModal');
+  document.getElementById('downloadBackupBtn')?.addEventListener('click', () => { location.href = '/api/admin/backup'; });
+  document.getElementById('restoreBackupBtn')?.addEventListener('click', () => gsdToast('Restore is disabled to protect the audit trail. Download a backup before requesting a controlled restore.', true));
+  document.getElementById('openWipeModalBtn')?.addEventListener('click', () => {
+    document.getElementById('wipeConfirmInput').value = '';
+    modal.classList.add('open');
+  });
+  document.getElementById('cancelWipeBtn')?.addEventListener('click', () => modal.classList.remove('open'));
+  document.getElementById('confirmWipeBtn')?.addEventListener('click', async () => {
+    try {
+      await gsdRequest('/admin/wipe', { method: 'POST', body: JSON.stringify({ confirmation: document.getElementById('wipeConfirmInput').value.trim() }) });
+      modal.classList.remove('open');
+      gsdToast('Inventory and transaction data were removed. User accounts remain intact.');
+    } catch (error) { gsdToast(error.message, true); }
+  });
+}
+
+async function gsdUserManagementPage(currentUser) {
+  const table = document.getElementById('usersTableBody');
+  const search = document.getElementById('userSearchInput');
+  const form = document.getElementById('userForm');
+  const modal = document.getElementById('userModal');
+  const passField = document.getElementById('userPassword');
+  const roleSelect = document.getElementById('userRoleSelect');
+  let users = [];
+  let currentPage = 1;
+  const pagination = gsdEnsurePagination('usersPagination', table.closest('.table-card'));
+
+  if (roleSelect) roleSelect.innerHTML = '<option value="Staff" selected>Staff</option><option value="Admin">Admin</option>';
+  document.getElementById('userModalTitle').textContent = 'Create User Account';
+  document.getElementById('editUserIndex')?.closest('.modal-field')?.remove();
+  const requestsWrap = document.getElementById('resetRequestsWrap');
+  const renderUsers = () => {
+    const query = search.value.trim().toLowerCase();
+    const visible = users.filter(user => `${user.name} ${user.username} ${user.role}`.toLowerCase().includes(query));
+    const pageCount = Math.max(1, Math.ceil(visible.length / GSD_PAGE_SIZE));
+    currentPage = Math.min(currentPage, pageCount);
+    const pageUsers = visible.slice((currentPage - 1) * GSD_PAGE_SIZE, currentPage * GSD_PAGE_SIZE);
+    table.innerHTML = pageUsers.map(user => `<tr>
+      <td>USR${String(user.id).padStart(4, '0')}</td><td class="user-name-cell">${gsdEscape(user.name)}</td>
+      <td>${gsdEscape(user.username)}</td><td>${gsdEscape(user.role)}</td><td><span class="status-pill ${user.status === 'Active' ? 'active-status' : 'inactive-status'}">${gsdEscape(user.status)}</span></td>
+      <td class="actions-cell"><div class="action-icons">
+        <button type="button" class="icon-btn" data-action="password" data-id="${user.id}" title="Reset password">Reset password</button>
+        <button type="button" class="icon-btn" data-action="toggle" data-id="${user.id}" title="Toggle account status">${user.status === 'Active' ? 'Deactivate' : 'Activate'}</button>
+        ${user.id !== currentUser.id ? `<button type="button" class="icon-btn delete-btn" data-action="delete" data-id="${user.id}" title="Delete user">Delete</button>` : ''}
+      </div></td></tr>`).join('');
+    currentPage = gsdRenderPagination(pagination, visible.length, currentPage, page => {
+      currentPage = page;
+      renderUsers();
+    });
+    document.getElementById('activeUsersKpi').textContent = users.filter(user => user.status === 'Active').length;
+    document.getElementById('totalUsersKpi').textContent = users.length;
+  };
+  const refresh = async () => {
+    users = (await gsdRequest('/admin/users')).users;
+    renderUsers();
+  };
+  document.getElementById('createUserBtn')?.addEventListener('click', () => {
+    form.reset();
+    roleSelect.value = 'Staff';
+    modal.classList.add('open');
+    document.getElementById('userFullName').focus();
+  });
+  document.getElementById('cancelUserModalBtn')?.addEventListener('click', () => modal.classList.remove('open'));
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      await gsdRequest('/admin/users', { method: 'POST', body: JSON.stringify({
+        name: document.getElementById('userFullName').value,
+        username: document.getElementById('userAccountName').value,
+        password: passField.value,
+        role: roleSelect.value
+      }) });
+      modal.classList.remove('open');
+      gsdToast('User account created.');
+      await refresh();
+    } catch (error) { gsdToast(error.message, true); }
+  });
+  search.addEventListener('input', () => { currentPage = 1; renderUsers(); });
+  table.addEventListener('click', async event => {
+    const button = event.target.closest('button[data-action]');
+    if (!button) return;
+    const target = users.find(user => user.id === Number(button.dataset.id));
+    if (!target) return;
+    try {
+      if (button.dataset.action === 'password') {
+        const password = await gsdPromptPassword('Reset password', `Set a new password for ${target.username} (at least 10 characters).`);
+        if (password === null) return;
+        await gsdRequest(`/admin/users/${target.id}`, { method: 'PATCH', body: JSON.stringify({ password }) });
+        gsdToast('Password reset. Share the temporary password with the user securely.');
+      } else if (button.dataset.action === 'toggle') {
+        await gsdRequest(`/admin/users/${target.id}`, { method: 'PATCH', body: JSON.stringify({ status: target.status === 'Active' ? 'Inactive' : 'Active' }) });
+      } else if (button.dataset.action === 'delete' && await gsdShowDialog({
+        title: 'Delete user account?', message: `Delete ${target.username}? This cannot be undone.`,
+        confirmLabel: 'Delete', cancelLabel: 'Cancel', danger: true
+      })) {
+        await gsdRequest(`/admin/users/${target.id}`, { method: 'DELETE' });
+      } else return;
+      await refresh();
+    } catch (error) { gsdToast(error.message, true); }
+  });
+  await refresh();
+  if (requestsWrap) {
+    let requestPage = 1;
+    const renderRequests = async (targetPage = requestPage) => {
+      const { requests } = await gsdRequest('/admin/reset-requests');
+      const pageCount = Math.max(1, Math.ceil(requests.length / GSD_PAGE_SIZE));
+      requestPage = Math.min(Math.max(targetPage, 1), pageCount);
+      const pageRequests = requests.slice((requestPage - 1) * GSD_PAGE_SIZE, requestPage * GSD_PAGE_SIZE);
+      requestsWrap.innerHTML = `<h2>Password Reset Requests</h2><table class="users-table reset-requests-table"><thead><tr><th>Username</th><th>Reason</th><th>Submitted</th><th>Status</th><th>Actions</th></tr></thead><tbody>${requests.length ? pageRequests.map(request => `<tr>
+        <td>${gsdEscape(request.username)}</td><td>${gsdEscape(request.reason)}</td><td>${gsdEscape(request.created_at)}</td><td>${gsdEscape(request.status)}</td><td>${request.status === 'Pending' ? `<div class="action-icons"><button type="button" class="icon-btn" data-reset-action="approve" data-id="${request.id}">Approve &amp; reset</button><button type="button" class="icon-btn delete-btn" data-reset-action="decline" data-id="${request.id}">Decline</button></div>` : gsdEscape(request.reviewer_name || '')}</td>
+      </tr>`).join('') : '<tr class="empty-state"><td colspan="5">No password reset requests.</td></tr>'}</tbody></table>`;
+      const requestPagination = gsdEnsurePagination('resetRequestsPagination', requestsWrap.querySelector('.reset-requests-table'));
+      requestPage = gsdRenderPagination(requestPagination, requests.length, requestPage, page => renderRequests(page));
+    };
+    if (requestsWrap.dataset.bound !== 'true') requestsWrap.addEventListener('click', async event => {
+      const button = event.target.closest('button[data-reset-action]');
+      if (!button) return;
+      const status = button.dataset.resetAction === 'approve' ? 'Approved' : 'Declined';
+      const body = { status };
+      if (status === 'Approved') {
+        body.password = await gsdPromptPassword('Approve reset request', 'Assign a temporary password (at least 10 characters) and share it with the user securely.');
+        if (body.password === null) return;
+      }
+      try {
+        await gsdRequest(`/admin/reset-requests/${button.dataset.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+        gsdToast(`Request ${status.toLowerCase()}.`);
+        await renderRequests(requestPage);
+      } catch (error) { gsdToast(error.message, true); }
+    });
+    requestsWrap.dataset.bound = 'true';
+    await renderRequests();
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  gsdInitialize().catch(error => gsdToast(error.message, true));
+});

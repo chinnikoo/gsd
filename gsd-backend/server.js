@@ -1,0 +1,411 @@
+const crypto = require('node:crypto');
+const path = require('node:path');
+const express = require('express');
+const helmet = require('helmet');
+const { client, col, connect, nextId, withTransaction, hashPassword, verifyPassword, timestamp } = require('./db');
+
+const app = express();
+const loginAttempts = new Map();
+const frontendDirectory = path.join(__dirname, '..', 'gsd-frontend');
+const port = Number(process.env.PORT || 3000);
+const sessionCookie = 'gsd_session';
+const sessionHours = 8;
+const production = process.env.NODE_ENV === 'production';
+
+app.disable('x-powered-by');
+app.set('trust proxy', 1); // Render (and most hosts) terminate HTTPS at a proxy; needed for req.ip / secure cookies.
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: '1mb' }));
+
+class HttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+const badRequest = message => new HttpError(400, message);
+
+// Wraps async handlers so thrown errors become JSON responses instead of unhandled rejections.
+const route = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(error => {
+  if (error instanceof HttpError) return res.status(error.status).json({ error: error.message });
+  console.error(error);
+  res.status(500).json({ error: 'Something went wrong on the server. Please try again.' });
+});
+
+const noId = { projection: { _id: 0 } };
+const strip = ({ _id, name_key, username_key, reference_key, password_hash, ...rest }) => rest;
+
+function publicUser(user) {
+  return { id: user.id, name: user.name, username: user.username, role: user.role, status: user.status };
+}
+
+function parseCookies(header = '') {
+  return Object.fromEntries(header.split(';').map(part => part.trim().split(/=(.*)/s).slice(0, 2)).filter(([key]) => key));
+}
+
+const tokenHash = token => crypto.createHash('sha256').update(token).digest('base64url');
+
+async function sessionUser(req) {
+  const token = parseCookies(req.headers.cookie)[sessionCookie];
+  if (!token) return null;
+  const session = await col.sessions.findOne({ _id: tokenHash(token), expires_at: { $gt: new Date() } });
+  if (!session) return null;
+  const user = await col.users.findOne({ id: session.user_id, status: 'Active' });
+  if (!user) await col.sessions.deleteOne({ _id: session._id });
+  return user ? { user, sessionId: session._id } : null;
+}
+
+const requireUser = route(async (req, res, next) => {
+  const found = await sessionUser(req);
+  if (!found) return res.status(401).json({ error: 'Please sign in to continue.' });
+  req.user = found.user;
+  req.sessionId = found.sessionId;
+  next();
+});
+
+function requireAdmin(req, res, next) {
+  if (req.user.role !== 'Admin') return res.status(403).json({ error: 'Administrator access is required.' });
+  next();
+}
+
+function validateText(value, label, maxLength = 180) {
+  const text = String(value ?? '').trim();
+  if (!text || text.length > maxLength) throw badRequest(`${label} is required and must be ${maxLength} characters or fewer.`);
+  return text;
+}
+
+function dateValue(value) {
+  const date = value ? String(value) : new Date().toISOString().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00Z`))) {
+    throw badRequest('Enter a valid transaction date.');
+  }
+  const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  if (date > tomorrow) throw badRequest('Transaction date cannot be in the future.');
+  return date;
+}
+
+const escapeRegex = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Only known return-slip fields are stored, as bounded strings.
+function cleanDetails(details) {
+  const allowed = ['originalSrf', 'returningOffice', 'department', 'resender', 'receiver', 'reason'];
+  const source = details && typeof details === 'object' ? details : {};
+  return Object.fromEntries(allowed.filter(key => source[key] != null).map(key => [key, String(source[key]).trim().slice(0, 500)]));
+}
+
+async function userNames(ids) {
+  const unique = [...new Set(ids.filter(id => id != null))];
+  const users = unique.length ? await col.users.find({ id: { $in: unique } }, { projection: { id: 1, name: 1 } }).toArray() : [];
+  return new Map(users.map(user => [user.id, user.name]));
+}
+
+// ---------- Auth ----------
+
+app.post('/api/auth/login', route(async (req, res) => {
+  const now = Date.now();
+  const attempt = loginAttempts.get(req.ip);
+  if (attempt && now - attempt.startedAt < 60_000 && attempt.count >= 10) {
+    return res.status(429).json({ error: 'Too many sign-in attempts. Try again in one minute.' });
+  }
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+  const user = username ? await col.users.findOne({ username_key: username.toLowerCase() }) : null;
+  if (!user || user.status !== 'Active' || !verifyPassword(password, user.password_hash)) {
+    if (!attempt || now - attempt.startedAt >= 60_000) loginAttempts.set(req.ip, { startedAt: now, count: 1 });
+    else attempt.count += 1;
+    return res.status(401).json({ error: 'Username or password is incorrect.' });
+  }
+  loginAttempts.delete(req.ip);
+  const token = crypto.randomBytes(32).toString('base64url');
+  await col.sessions.insertOne({ _id: tokenHash(token), user_id: user.id, expires_at: new Date(now + sessionHours * 3600 * 1000) });
+  res.setHeader('Set-Cookie', `${sessionCookie}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionHours * 3600}${production ? '; Secure' : ''}`);
+  res.json({ user: publicUser(user) });
+}));
+
+app.post('/api/auth/logout', requireUser, route(async (req, res) => {
+  await col.sessions.deleteOne({ _id: req.sessionId });
+  res.setHeader('Set-Cookie', `${sessionCookie}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
+  res.json({ ok: true });
+}));
+
+app.get('/api/auth/me', route(async (req, res) => {
+  const found = await sessionUser(req);
+  res.json({ user: found ? publicUser(found.user) : null });
+}));
+
+app.post('/api/auth/reset-requests', route(async (req, res) => {
+  const username = String(req.body?.username || '').trim();
+  const reason = String(req.body?.reason || '').trim();
+  if (!username || username.length > 80 || reason.length < 10 || reason.length > 1000) {
+    return res.status(400).json({ error: 'Enter your username and a reason of at least 10 characters.' });
+  }
+  const user = await col.users.findOne({ username_key: username.toLowerCase(), status: 'Active' });
+  if (user) {
+    await col.resetRequests.insertOne({
+      id: await nextId('password_reset_requests'), username: user.username, reason, status: 'Pending',
+      reviewer_id: null, reviewer_name: null, created_at: timestamp(), reviewed_at: null
+    });
+  }
+  res.status(202).json({ message: 'If the account is active, the reset request has been sent to an administrator.' });
+}));
+
+// ---------- Inventory & movements ----------
+
+app.get('/api/inventory', requireUser, route(async (req, res) => {
+  const items = await col.items.find({}, noId).sort({ name_key: 1 }).toArray();
+  const firsts = await col.transactions.aggregate([
+    { $sort: { id: 1 } },
+    { $group: { _id: '$item_id', actor_id: { $first: '$actor_id' }, actor_name: { $first: '$actor_name' } } }
+  ]).toArray();
+  const firstByItem = new Map(firsts.map(row => [row._id, row]));
+  const names = await userNames(firsts.map(row => row.actor_id));
+  res.json({ items: items.map(item => {
+    const first = firstByItem.get(item.id);
+    return { ...strip(item), created_by: (first && (names.get(first.actor_id) || first.actor_name)) || 'System' };
+  }) });
+}));
+
+app.get('/api/transactions', requireUser, route(async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 500);
+  const filter = ['PO', 'SRF', 'RETURN', 'OPENING'].includes(req.query.type) ? { type: req.query.type } : {};
+  const rows = await col.transactions.find(filter, noId).sort({ occurred_on: -1, id: -1 }).limit(limit).toArray();
+  const items = await col.items.find({ id: { $in: [...new Set(rows.map(row => row.item_id))] } }, noId).toArray();
+  const itemById = new Map(items.map(item => [item.id, item]));
+  const names = await userNames(rows.map(row => row.actor_id));
+  res.json({ transactions: rows.map(row => ({
+    ...strip(row),
+    item_name: itemById.get(row.item_id)?.name ?? '(deleted item)',
+    unit: itemById.get(row.item_id)?.unit ?? row.metadata?.unit ?? '',
+    actor_name: names.get(row.actor_id) || row.actor_name || null
+  })) });
+}));
+
+app.post('/api/transactions', requireUser, route(async (req, res) => {
+  const body = req.body || {};
+  const { type } = body;
+  if (!['PO', 'SRF', 'RETURN'].includes(type)) throw badRequest('Choose a valid movement type.');
+  const reference = validateText(body.reference, 'Reference', 100);
+  const itemName = validateText(body.itemName, 'Item name');
+  const quantity = Number(body.quantity);
+  if (!Number.isFinite(quantity) || quantity <= 0) throw badRequest('Quantity must be greater than zero.');
+  const occurredOn = dateValue(body.date);
+  const unitCost = body.unitCost === '' || body.unitCost == null ? null : Number(body.unitCost);
+  if (unitCost != null && (!Number.isFinite(unitCost) || unitCost < 0)) throw badRequest('Unit cost cannot be negative.');
+  const office = body.office ? validateText(body.office, 'Office', 120) : null;
+  const details = cleanDetails(body.details);
+  const notes = String(body.notes || '').trim().slice(0, 1000);
+
+  const result = await withTransaction(async session => {
+    let item = await col.items.findOne({ name_key: itemName.toLowerCase() }, { session });
+    if (!item && type !== 'PO') throw badRequest('This item is not in inventory yet.');
+    if (!item) {
+      item = {
+        id: await nextId('inventory_items', session), name: itemName, name_key: itemName.toLowerCase(),
+        category: validateText(body.category, 'Category', 120), unit: validateText(body.unit, 'Unit', 40).toUpperCase(),
+        quantity: 0, reorder_point: 7, created_at: timestamp()
+      };
+      await col.items.insertOne(item, { session });
+    }
+    if (type === 'RETURN') {
+      const originalSrf = validateText(details.originalSrf, 'Original SRF reference', 100);
+      const issue = await col.transactions.findOne({ item_id: item.id, type: 'SRF', reference_key: originalSrf.toLowerCase() }, { session });
+      if (!issue) throw badRequest('The original SRF was not found for this item.');
+      const returns = await col.transactions.find({ item_id: item.id, type: 'RETURN' }, { session }).toArray();
+      const returned = returns
+        .filter(row => String(row.metadata?.originalSrf || '').toLowerCase() === originalSrf.toLowerCase())
+        .reduce((sum, row) => sum + Number(row.quantity), 0);
+      const remaining = Number(issue.quantity) - returned;
+      if (quantity > remaining) throw badRequest(`Return exceeds unused quantity on the SRF. Returnable: ${remaining} ${item.unit}.`);
+    }
+    if (type === 'PO') {
+      const category = body.category ? validateText(body.category, 'Category', 120) : item.category;
+      const unit = body.unit ? validateText(body.unit, 'Unit', 40).toUpperCase() : item.unit;
+      await col.items.updateOne({ id: item.id }, { $set: { category, unit }, $inc: { quantity } }, { session });
+    } else if (type === 'SRF') {
+      // Conditional update: only succeeds when enough stock exists, so stock can never go negative.
+      const updated = await col.items.updateOne({ id: item.id, quantity: { $gte: quantity } }, { $inc: { quantity: -quantity } }, { session });
+      if (!updated.modifiedCount) throw badRequest(`Insufficient stock. Available: ${item.quantity} ${item.unit}.`);
+    } else {
+      await col.items.updateOne({ id: item.id }, { $inc: { quantity } }, { session });
+    }
+    const transactionId = await nextId('transactions', session);
+    await col.transactions.insertOne({
+      id: transactionId, item_id: item.id, type, reference, reference_key: reference.toLowerCase(), occurred_on: occurredOn,
+      quantity, unit_cost: unitCost, office, notes, metadata: { ...details, unit: body.unit ? String(body.unit).slice(0, 40) : item.unit },
+      actor_id: req.user.id, actor_name: req.user.name, created_at: timestamp()
+    }, { session });
+    const updatedItem = await col.items.findOne({ id: item.id }, { session, ...noId });
+    return { transactionId, item: strip(updatedItem) };
+  });
+  res.status(201).json(result);
+}));
+
+app.get('/api/stock-card', requireUser, route(async (req, res) => {
+  const query = String(req.query.item || '').trim();
+  const filter = query ? { name_key: { $regex: escapeRegex(query.toLowerCase()) } } : {};
+  const items = await col.items.find(filter, noId).sort({ name_key: 1 }).toArray();
+  const item = items.find(row => row.name_key === query.toLowerCase()) || items[0] || null;
+  if (!item) return res.json({ item: null, transactions: [], matches: [] });
+  const rows = await col.transactions.find({ item_id: item.id }, noId).sort({ occurred_on: 1, id: 1 }).toArray();
+  const names = await userNames(rows.map(row => row.actor_id));
+  let balance = 0;
+  const transactions = rows.map(row => {
+    balance += row.type === 'SRF' ? -Number(row.quantity) : Number(row.quantity);
+    return { ...strip(row), actor_name: names.get(row.actor_id) || row.actor_name || null, balance, metadata: row.metadata || {} };
+  });
+  res.json({ item: strip(item), transactions, matches: items.map(({ id, name }) => ({ id, name })) });
+}));
+
+// ---------- Admin: users & reset requests ----------
+
+const activeAdminCount = () => col.users.countDocuments({ role: 'Admin', status: 'Active' });
+
+app.get('/api/admin/users', requireUser, requireAdmin, route(async (req, res) => {
+  const users = await col.users.find({}, { projection: { _id: 0, id: 1, name: 1, username: 1, role: 1, status: 1, created_at: 1 } }).sort({ id: 1 }).toArray();
+  res.json({ users });
+}));
+
+app.post('/api/admin/users', requireUser, requireAdmin, route(async (req, res) => {
+  const name = validateText(req.body?.name, 'Name', 120);
+  const username = validateText(req.body?.username, 'Username', 80);
+  const password = validateText(req.body?.password, 'Password', 200);
+  const role = req.body?.role;
+  if (!['Admin', 'Staff'].includes(role)) throw badRequest('Role must be Admin or Staff.');
+  if (password.length < 10) throw badRequest('Password must be at least 10 characters.');
+  if (await col.users.findOne({ username_key: username.toLowerCase() })) throw badRequest('That username is already in use.');
+  const user = {
+    id: await nextId('users'), name, username, username_key: username.toLowerCase(),
+    password_hash: hashPassword(password), role, status: 'Active', created_at: timestamp()
+  };
+  try {
+    await col.users.insertOne(user);
+  } catch (error) {
+    if (error.code === 11000) throw badRequest('That username is already in use.');
+    throw error;
+  }
+  res.status(201).json({ user: publicUser(user) });
+}));
+
+app.patch('/api/admin/users/:id', requireUser, requireAdmin, route(async (req, res) => {
+  const id = Number(req.params.id);
+  const user = await col.users.findOne({ id });
+  if (!user) return res.status(404).json({ error: 'User not found.' });
+  const { role, status, password } = req.body || {};
+  if (role && !['Admin', 'Staff'].includes(role)) throw badRequest('Role must be Admin or Staff.');
+  if (status && !['Active', 'Inactive'].includes(status)) throw badRequest('Status must be Active or Inactive.');
+  if (password && String(password).length < 10) throw badRequest('Password must be at least 10 characters.');
+  if (user.id === req.user.id && status === 'Inactive') throw badRequest('You cannot deactivate your own account.');
+  if (user.role === 'Admin' && user.status === 'Active' && (role === 'Staff' || status === 'Inactive') && await activeAdminCount() <= 1) {
+    throw badRequest('At least one active administrator must remain.');
+  }
+  const changes = {};
+  if (role) changes.role = role;
+  if (status) changes.status = status;
+  if (password) changes.password_hash = hashPassword(String(password));
+  if (Object.keys(changes).length) await col.users.updateOne({ id }, { $set: changes });
+  // A password change or deactivation signs the user out everywhere (except the admin's own current session).
+  if (password || status === 'Inactive') await col.sessions.deleteMany({ user_id: id, _id: { $ne: req.sessionId } });
+  res.json({ user: publicUser(await col.users.findOne({ id })) });
+}));
+
+app.delete('/api/admin/users/:id', requireUser, requireAdmin, route(async (req, res) => {
+  const id = Number(req.params.id);
+  const user = await col.users.findOne({ id });
+  if (!user) return res.status(404).json({ error: 'User not found.' });
+  if (id === req.user.id) throw badRequest('You cannot delete your own account.');
+  if (user.role === 'Admin' && user.status === 'Active' && await activeAdminCount() <= 1) {
+    throw badRequest('At least one active administrator must remain.');
+  }
+  await col.users.deleteOne({ id });
+  await col.sessions.deleteMany({ user_id: id });
+  res.json({ ok: true }); // Movement history keeps the stored actor_name for the audit trail.
+}));
+
+app.get('/api/admin/reset-requests', requireUser, requireAdmin, route(async (req, res) => {
+  const requests = await col.resetRequests.find({}, noId).sort({ created_at: -1, id: -1 }).toArray();
+  res.json({ requests });
+}));
+
+app.patch('/api/admin/reset-requests/:id', requireUser, requireAdmin, route(async (req, res) => {
+  const status = req.body?.status;
+  if (!['Approved', 'Declined'].includes(status)) throw badRequest('Choose Approved or Declined.');
+  const requestId = Number(req.params.id);
+  const request = await col.resetRequests.findOne({ id: requestId, status: 'Pending' });
+  if (!request) return res.status(404).json({ error: 'Pending request not found.' });
+  let account = null;
+  let passwordHash = null;
+  if (status === 'Approved') {
+    const password = String(req.body?.password || '');
+    if (password.length < 10) throw badRequest('Provide a temporary password of at least 10 characters.');
+    account = await col.users.findOne({ username_key: request.username.toLowerCase(), status: 'Active' });
+    if (!account) throw badRequest('The account is no longer active.');
+    passwordHash = hashPassword(password);
+  }
+  await withTransaction(async session => {
+    if (account) {
+      await col.users.updateOne({ id: account.id }, { $set: { password_hash: passwordHash } }, { session });
+      await col.sessions.deleteMany({ user_id: account.id }, { session });
+    }
+    await col.resetRequests.updateOne({ id: requestId, status: 'Pending' }, {
+      $set: { status, reviewer_id: req.user.id, reviewer_name: req.user.name, reviewed_at: timestamp() }
+    }, { session });
+  });
+  res.json({ ok: true });
+}));
+
+// ---------- Admin: backup & wipe ----------
+
+app.get('/api/admin/backup', requireUser, requireAdmin, route(async (req, res) => {
+  const all = async (collection, sort = { id: 1 }) => (await collection.find({}, noId).sort(sort).toArray()).map(strip);
+  const backup = {
+    exportedAt: new Date().toISOString(),
+    inventory: await all(col.items),
+    transactions: await all(col.transactions),
+    users: await all(col.users),
+    passwordResetRequests: await all(col.resetRequests)
+  };
+  res.setHeader('Content-Disposition', `attachment; filename="gsd-backup-${new Date().toISOString().slice(0, 10)}.json"`);
+  res.json(backup);
+}));
+
+app.post('/api/admin/wipe', requireUser, requireAdmin, route(async (req, res) => {
+  if (req.body?.confirmation !== 'WIPE') throw badRequest('Type WIPE to confirm.');
+  await withTransaction(async session => {
+    await col.transactions.deleteMany({}, { session });
+    await col.items.deleteMany({}, { session });
+    await col.resetRequests.deleteMany({}, { session });
+  });
+  res.json({ ok: true });
+}));
+
+app.get('/api/health', route(async (req, res) => {
+  await client.db('admin').command({ ping: 1 });
+  res.json({ ok: true });
+}));
+
+// ---------- Pages ----------
+
+// Server-side page guard: logged-out users only see the login page, Staff never receive admin pages.
+const protectedPages = new Set(['inventory.html', 'purchaseorder.html', 'stockout.html', 'stockcard.html', 'returnslip.html', 'settings.html', 'usermanagement.html']);
+const adminPages = new Set(['settings.html', 'usermanagement.html']);
+app.use(route(async (req, res, next) => {
+  const page = req.path.replace(/^\//, '').toLowerCase();
+  if (!protectedPages.has(page)) return next();
+  const found = await sessionUser(req);
+  if (!found) return res.redirect('/index.html');
+  if (adminPages.has(page) && found.user.role !== 'Admin') return res.redirect('/inventory.html');
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+}));
+app.use(express.static(frontendDirectory));
+app.get('*', (req, res) => res.sendFile(path.join(frontendDirectory, 'index.html')));
+
+connect().then(() => {
+  const server = app.listen(port, () => {
+    console.log(`GSD Inventory System listening on http://localhost:${port}`);
+    if (!production) console.log('Demo accounts: gsd_admin / ChangeMe!2026 and gsd_staff / StaffPass!2026');
+  });
+  const shutdown = () => server.close(() => client.close().finally(() => process.exit(0)));
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}).catch(error => {
+  console.error('Failed to start:', error.message);
+  process.exit(1);
+});

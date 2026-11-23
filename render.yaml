@@ -1,0 +1,26 @@
+# Render Blueprint: Render > New > Blueprint > pick this repository.
+# One web service serves both the API and the gsd-frontend pages.
+services:
+  - type: web
+    name: gsd-inventory
+    runtime: node
+    plan: free
+    buildCommand: cd gsd-backend && npm ci --omit=dev
+    startCommand: cd gsd-backend && npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: MONGODB_DB
+        value: gsd
+      # The values below are secrets: Render asks you for them when the Blueprint is created.
+      - key: MONGODB_URI
+        sync: false
+      # Only used if the database has no users yet (i.e. you did not run the migration).
+      - key: GSD_ADMIN_PASSWORD
+        sync: false
+      - key: GSD_STAFF_PASSWORD
+        sync: false
